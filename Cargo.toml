@@ -1,0 +1,16 @@
+[package]
+name = "mousekeys"
+version = "0.1.0"
+edition = "2021"
+authors = ["JRPData@github", "Claude / Anthropic.ai", "ChatGPT @ OpenAI.com"]
+description = "A mousekeys daemon"
+include = ["Cargo.toml", "src/**", "config/mousekeys.conf"]
+
+[dependencies]
+evdev = "0.13.1"
+anyhow = "1.0"
+signal-hook = "0.3.18"
+
+[[bin]]
+name = "mousekeys"
+path = "src/main.rs"
