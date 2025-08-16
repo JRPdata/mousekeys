@@ -20,7 +20,9 @@ Must be run as root: sudo ./mousekeys &
 ---
 
 WARNING: Not heavily tested, so use at your own risk! (It is multithreaded, so there is a chance there may be a bug somewhere that causes a lockup while processing xinput events.)
+
 WARNING: Not heavily tested, so use at your own risk! (It is multithreaded, so there is a chance there may be a bug somewhere that causes a lockup while processing xinput events.)
+
 WARNING: Not heavily tested, so use at your own risk! (It is multithreaded, so there is a chance there may be a bug somewhere that causes a lockup while processing xinput events.)
 
 ---
@@ -34,6 +36,12 @@ Copy the the config/mousekeys.conf to the target/release/ and edit it (it has a 
 `cd target/releast`
 
 Run `sudo ./mousekeys &` to launch it as a daemon. Can be kept running interactively to see information about what keyboard it is (prioritizing) using.
+
+To tune the settings: I suggest running it interactively at first (no &), hit CTRL-C if it is not to your taste to kill it, and then tweak the .conf settings and repeat until it is to your preferences.
+
+I don't recommend adding it to startup scripts as it is very much not widely tested.
+
+My own current environment that I am using it with is the latest Ubuntu 24 TLS (gnome-desktop 34, mutter 36, Wayland) with an external USB keyboard.
 
 ---
 
