@@ -38,14 +38,19 @@
  * - Automatic keyboard selection (prefers external over built-in)
  * 
  * USAGE:
- *   sudo ./mousekeys [config_file]
+ *   sudo ./mousekeys [--config config_file] [--fixed-kb-dev /dev/input/eventNNN]
  * 
+ * When using the argument --fixed-kb-dev to specify the input device,
+ * it will only search/reconnect on the given device.
+ *
  * Press Ctrl+C or send SIGTERM to shut down gracefully.
  * 
  * Authors: Claude @ Anthropic, ChatGPT @ OpenAI, JRPData @ github
  * License: MIT License
  */
 
+
+use clap::Parser;
 use evdev::{Device as EvDevice, EventType, KeyCode, InputEvent};
 use std::{
     io::{BufRead, Write},
@@ -59,6 +64,20 @@ use std::{
 };
 use anyhow::{Result, Context};
 use signal_hook::{consts::signal::*, iterator::Signals};
+
+#[derive(Parser)]
+#[command(name = "mousekeys")]
+#[command(about = "A mousekeys daemon")]
+struct Args {
+    /// Path to the configuration file
+    #[arg(short, long)]
+    #[arg(long, default_value = "mousekeys.conf")]
+    config: String,
+    
+    /// Fixed keyboard device path (i.e. /dev/input/event5)
+    #[arg(short, long, default_value = "")]
+    fixed_kb_dev: String,
+}
 
 // --- Configuration ---
 #[derive(Debug, Clone)]
@@ -93,7 +112,7 @@ impl Default for Config {
 }
 
 impl Config {
-    fn load_from_file(path: &str) -> Self {
+    fn load_from_file(path: String) -> Self {
         let mut cfg = Config::default();
         if let Ok(file) = fs::File::open(path) {
             for line in std::io::BufReader::new(file).lines().flatten() {
@@ -282,12 +301,22 @@ impl ShutdownCoordinator {
 
 // --- Main ---
 fn main() -> Result<()> {
+    let args = Args::parse();
+    // Handle fixed_kb_dev (with default empty string)
+    if args.fixed_kb_dev.to_string().is_empty() {
+        println!("Using automatic keyboard device detection.");
+    } else {
+        println!("Using fixed keyboard device: {}", args.fixed_kb_dev);
+    }
+
     // Check for root privileges first
     check_root_privileges()?;
-    
-    let cfg = Config::load_from_file("mousekeys.conf");
+
+    let cfg = Config::load_from_file(args.config);
     cfg.validate().context("Invalid configuration")?;
     println!("Loaded config: {:?}", cfg);
+    // a value of "" is default (smart automatic detection)
+    let fixed_kb_dev = args.fixed_kb_dev;
 
     // Set up panic hook for cleaner shutdown
     let original_hook = panic::take_hook();
@@ -296,7 +325,7 @@ fn main() -> Result<()> {
         original_hook(panic_info);
     }));
 
-    let result = panic::catch_unwind(|| run_mousekeys(cfg));
+    let result = panic::catch_unwind(|| run_mousekeys(cfg, &fixed_kb_dev));
     match result {
         Ok(r) => r,
         Err(_) => {
@@ -425,11 +454,11 @@ fn log_to_syslog(error_msg: &str, solution_msg: &str) {
 }
 
 // --- Core run loop with reconnection logic ---
-fn run_mousekeys(cfg: Config) -> Result<()> {
+fn run_mousekeys(cfg: Config, fixed_kb_dev: &String) -> Result<()> {
     println!("Starting mousekeys daemon...");
 
     loop {
-        match run_mousekeys_session(&cfg) {
+        match run_mousekeys_session(&cfg, &fixed_kb_dev) {
             Ok(_) => {
                 println!("Session ended normally");
                 break;
@@ -445,15 +474,15 @@ fn run_mousekeys(cfg: Config) -> Result<()> {
     Ok(())
 }
 
-fn run_mousekeys_session(cfg: &Config) -> Result<()> {
+fn run_mousekeys_session(cfg: &Config, fixed_kb_dev: &String) -> Result<()> {
     // Find initial keyboard and print the list
     let mut keyboard_list_signature = String::new();
-    let all_keyboards = find_all_keyboards();
+    let all_keyboards = find_all_keyboards(fixed_kb_dev);
     print_keyboards_if_changed(&all_keyboards, &mut keyboard_list_signature);
     
     let initial_keyboard = all_keyboards.into_iter().next()
         .ok_or_else(|| anyhow::anyhow!("No suitable keyboard found"))?;
-
+        
     println!("Starting session with keyboard: {} ({})", initial_keyboard.name, initial_keyboard.path.display());
 
     // Open the initial keyboard device
@@ -609,6 +638,7 @@ fn run_mousekeys_session(cfg: &Config) -> Result<()> {
         let shutdown_clone3 = Arc::clone(&coordinator.shutdown);
         let current_keyboard_name = initial_keyboard.name.clone();
         let current_keyboard_priority = initial_keyboard.priority;
+        let fixed_kb_dev_clone = fixed_kb_dev.clone();
         let kbd_monitor_handle = thread::spawn(move || {
             let mut last_scan = Instant::now();
             let mut keyboard_list_signature = String::new();
@@ -618,7 +648,7 @@ fn run_mousekeys_session(cfg: &Config) -> Result<()> {
                 sleep(Duration::from_millis(500)); // Check every 500ms
                 
                 if last_scan.elapsed() >= scan_interval {
-                    let all_keyboards = find_all_keyboards();
+                    let all_keyboards = find_all_keyboards(&fixed_kb_dev_clone);
                     let list_changed = print_keyboards_if_changed(&all_keyboards, &mut keyboard_list_signature);
                     
                     if let Some(best_keyboard) = all_keyboards.into_iter().next() {
@@ -679,7 +709,9 @@ fn run_mousekeys_session(cfg: &Config) -> Result<()> {
     while !coordinator.should_shutdown() {
         // Check for keyboard switch commands
         if let Ok(KeyboardCommand::SwitchTo(new_keyboard)) = kbd_rx.try_recv() {
-            println!("Switching to new keyboard: {} ({})", new_keyboard.name, new_keyboard.path.display());
+            if fixed_kb_dev.to_string().is_empty() || new_keyboard.path.display().to_string() == fixed_kb_dev.to_string() {
+                println!("Switching to new keyboard: {} ({})", new_keyboard.name, new_keyboard.path.display());
+            }
             
             // Ungrab current keyboard
             if let Err(e) = guard.ungrab() {
@@ -748,7 +780,7 @@ fn run_mousekeys_session(cfg: &Config) -> Result<()> {
             if coordinator.should_shutdown() {
                 break;
             }
-            
+
             if event.event_type() == EventType::KEY {
                 let code = KeyCode(event.code());
                 let value = event.value();
@@ -799,34 +831,47 @@ fn run_mousekeys_session(cfg: &Config) -> Result<()> {
                     );
 
                     if is_mousekey && state.mousekeys_enabled {
-                        if let (Ok(mut mv), Ok(mods)) = (move_state.try_lock(), modifiers.try_lock()) {
-                            mv.modifiers = *mods;
-                            match value {
-                                1 => {
-                                    if let Err(e) = handle_key_press(&mouse_dev, &tx, &mut state, code, cfg) {
-                                        eprintln!("Error handling key press: {}", e);
-                                    }
-                                    if matches!(code,
-                                        KeyCode::KEY_KP1 | KeyCode::KEY_KP2 | KeyCode::KEY_KP3 |
-                                        KeyCode::KEY_KP4 | KeyCode::KEY_KP6 |
-                                        KeyCode::KEY_KP7 | KeyCode::KEY_KP8 | KeyCode::KEY_KP9) {
-                                        mv.velocity_x = 0.0;
-                                        mv.velocity_y = 0.0;
-                                        mv.pressed_keys.insert(code);
-                                        mv.active = true;
-                                    }
+                        // Always lock on release to guarantee cleanup
+                        let (mut mv, mods) = if value == 0 {
+                            (move_state.lock().unwrap(), modifiers.lock().unwrap())
+                        } else if let (Ok(mv), Ok(mods)) = (move_state.try_lock(), modifiers.try_lock()) {
+                            (mv, mods)
+                        } else {
+                            // A skipped press (don't wait for lock)
+                            continue;
+                        };
+
+                        mv.modifiers = *mods;
+                        match value {
+                            1 => {
+                                if let Err(e) = handle_key_press(&mouse_dev, &tx, &mut state, code, cfg) {
+                                    eprintln!("Error handling key press: {}", e);
                                 }
-                                0 => {
-                                    if let Err(e) = handle_key_release(&mouse_dev, &mut state, code) {
-                                        eprintln!("Error handling key release: {}", e);
-                                    }
-                                    mv.pressed_keys.remove(&code);
-                                    if mv.pressed_keys.is_empty() { mv.active = false; }
+                                if matches!(code,
+                                    KeyCode::KEY_KP1 | KeyCode::KEY_KP2 | KeyCode::KEY_KP3 |
+                                    KeyCode::KEY_KP4 | KeyCode::KEY_KP6 |
+                                    KeyCode::KEY_KP7 | KeyCode::KEY_KP8 | KeyCode::KEY_KP9
+                                ) {
+                                    mv.velocity_x = 0.0;
+                                    mv.velocity_y = 0.0;
+                                    mv.pressed_keys.insert(code);
+                                    mv.active = true;
                                 }
-                                _ => {}
                             }
+                            0 => {
+                                if let Err(e) = handle_key_release(&mouse_dev, &mut state, code) {
+                                    eprintln!("Error handling key release: {}", e);
+                                }
+                                mv.pressed_keys.remove(&code);
+                                if mv.pressed_keys.is_empty() {
+                                    mv.active = false;
+                                }
+                            }
+                            _ => {}
                         }
-                        continue;
+                        if state.mousekeys_enabled {
+                            continue;
+                        }
                     }
 
                     if code == KeyCode::KEY_NUMLOCK && value == 1 { numlock_pressed = true; }
@@ -882,7 +927,7 @@ fn run_mousekeys_session(cfg: &Config) -> Result<()> {
 }
 
 // --- Find all keyboards and return sorted list ---
-fn find_all_keyboards() -> Vec<KeyboardCandidate> {
+fn find_all_keyboards(fixed_kb_dev: &String) -> Vec<KeyboardCandidate> {
     let input_dir = std::path::Path::new("/dev/input");
     let entries = match fs::read_dir(input_dir) {
         Ok(entries) => entries,
@@ -914,11 +959,13 @@ fn find_all_keyboards() -> Vec<KeyboardCandidate> {
                                 // Calculate priority score (higher = better)
                                 let priority = calculate_keyboard_priority(&name_lower, keys);
                                 
-                                candidates.push(KeyboardCandidate {
-                                    path,
-                                    name,
-                                    priority,
-                                });
+                                if fixed_kb_dev.to_string().is_empty() || fixed_kb_dev.to_string() == path.display().to_string() {
+                                    candidates.push(KeyboardCandidate {
+                                        path,
+                                        name,
+                                        priority,
+                                    });
+                                }
                             }
                         }
                     }
@@ -926,7 +973,7 @@ fn find_all_keyboards() -> Vec<KeyboardCandidate> {
             }
         }
     }
-    
+
     // Sort by priority (highest first)
     candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
     candidates

@@ -10,6 +10,7 @@ include = ["Cargo.toml", "src/**", "config/mousekeys.conf"]
 evdev = "0.13.1"
 anyhow = "1.0"
 signal-hook = "0.3.18"
+clap = {version = "4.5.45", features = ["derive"]}
 
 [[bin]]
 name = "mousekeys"
